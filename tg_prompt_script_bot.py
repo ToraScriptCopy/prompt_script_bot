@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
 """
-tg_prompt_script_bot_v2.py
+tg_prompt_script_bot_v3.py
 
-Improved version:
-- 20 platforms
-- 20 languages
-- Better scene splitting and "mini-AI" local enhancer (no external API)
-- Export to JSON/ZIP with prompts and metadata (/export)
-- /improve to enhance generated prompts using built-in heuristics
-- Safe: reads TG_TOKEN from environment; DO NOT hardcode your token.
+Features:
+- Clickable menu (no need to type /start; any message will show the menu)
+- Rich inline-menu flow for creating prompts (language -> platform -> description -> scenes -> duration)
+- "Mini-AI" local enhancer (heuristic) and optional Deepseek API integration (if DEEPSEEK_API_KEY is set)
+- Commands: /menu, /generate (if flow completed), /improve, /export, /settings
+- Export prompts as ZIP with prompts.json
+Security:
+- DO NOT hardcode TG_TOKEN or DEEPSEEK_API_KEY into files that will be uploaded publicly.
+- Set environment variables on your host (Render/Replit/VPS): TG_TOKEN and optionally DEEPSEEK_API_KEY.
 
-Usage:
-- /start to begin
-- pick language & platform
-- send description, number of scenes, duration (or 'var')
-- /generate to build prompts
-- /improve to enhance last generated prompts
-- /export to receive a ZIP with prompts.json
+How to run:
+1) pip install -r requirements.txt
+2) export TG_TOKEN="your_telegram_token"
+   export DEEPSEEK_API_KEY="your_deepseek_token"   # optional
+3) python tg_prompt_script_bot_v3.py
 """
 import os
 import logging
 import json
 import random
-from typing import List, Dict
+import zipfile
+import io
+from pathlib import Path
 from datetime import datetime
+from typing import List, Dict, Any
+
+import requests
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -34,7 +39,6 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    ConversationHandler,
     MessageHandler,
     CallbackQueryHandler,
     filters,
@@ -43,332 +47,371 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# States
-(
-    CHOOSING_LANG,
-    CHOOSING_PLATFORM,
-    INPUT_DESC,
-    INPUT_SCENES,
-    INPUT_DURATION,
-    CONFIRM
-) = range(6)
-
-# 20 platforms (mix of real and common model names)
+# --- Config ---
 PLATFORMS = [
-    "ChatGPT", "Gemini", "Llama 3", "Veo 3", "Veo 3.1", "Sora", "Deepseek",
-    "Midjourney", "Stable Diffusion", "DALL·E", "Runway", "Imagen",
-    "Claude", "Perplexity", "BlueWillow", "DreamStudio", "InvokeAI",
-    "ControlNet", "Deforum", "CustomModel"
+    "ChatGPT","Gemini","Llama 3","Veo 3","Veo 3.1","Sora","Deepseek","Midjourney",
+    "Stable Diffusion","DALL·E","Runway","Imagen","Claude","Perplexity","BlueWillow",
+    "DreamStudio","InvokeAI","ControlNet","Deforum","CustomModel","Mistral","Falcon",
+    "Anthropic","OpenJourney","Ernie-ViLG","GLIDE","Kandinsky","Pika","Poe","Grok"
 ]
 
-# 20 languages (language code -> display)
 LANGUAGES = {
-    "ru": "Русский", "en": "English", "es": "Español", "fr": "Français",
-    "de": "Deutsch", "it": "Italiano", "pt": "Português", "nl": "Nederlands",
-    "pl": "Polski", "sv": "Svenska", "no": "Norsk", "da": "Dansk",
-    "fi": "Suomi", "cs": "Čeština", "hu": "Magyar", "ro": "Română",
-    "tr": "Türkçe", "ja": "日本語", "ko": "한국어", "zh": "中文"
+    "ru":"Русский","en":"English","es":"Español","fr":"Français","de":"Deutsch",
+    "it":"Italiano","pt":"Português","nl":"Nederlands","pl":"Polski","sv":"Svenska",
+    "no":"Norsk","da":"Dansk","fi":"Suomi","cs":"Čeština","hu":"Magyar","ro":"Română",
+    "tr":"Türkçe","ja":"日本語","ko":"한국어","zh":"中文"
 }
 
-# Platform-specific templates (improved)
-PLATFORM_TEMPLATES = {
-    "default": "{scene_title}\n{scene_brief}\nStyle: {style}\nMood: {mood}\nCamera: {camera}\nDuration: {duration}s\nAspect: {aspect}\nNegative: {negative}\nNotes: {details}",
-}
-# Give each platform a variant; many reuse the same structure but with small syntax differences
-for p in PLATFORMS:
-    PLATFORM_TEMPLATES[p] = PLATFORM_TEMPLATES["default"].replace("Notes:", f"Notes ({p}):")
-
-# Style & mood suggestions
-STYLE_POOL = ["photorealistic","cinematic lighting","anime","art-house","retro 80s","cyberpunk","fantasy","painterly","surreal","documentary"]
+STYLE_POOL = [
+    "photorealistic","cinematic lighting","anime","art-house","retro 80s","cyberpunk",
+    "fantasy","painterly","surreal","documentary","hyper-detailed","low-poly"
+]
 MOOD_POOL = ["tense","dreamy","melancholic","uplifting","ominous","hopeful","mysterious","whimsical"]
 
-# Mini-AI enhancer: simple heuristics to expand a short scene into richer description
-ADJECTIVES = ["soft", "harsh", "glowing", "muted", "vibrant", "washed-out", "textured", "slick", "grainy", "pristine"]
-CAMERA_MOVES = ["close-up", "wide shot", "pan right", "pan left", "tracking shot", "dolly in", "dolly out", "overhead", "slow zoom"]
-COLOR_PALETTES = ["neon blues and magentas","warm golden hour tones","muted earth tones","high-contrast monochrome","pastel palette"]
+# Per-user session storage (in-memory)
+SESSIONS: Dict[int, Dict[str, Any]] = {}
 
-# Helpers
+# Utility: main menu keyboard
+def main_menu_kb():
+    kb = [
+        [InlineKeyboardButton("Create Prompts", callback_data="menu_create"),
+         InlineKeyboardButton("Improve Last", callback_data="menu_improve")],
+        [InlineKeyboardButton("Export", callback_data="menu_export"),
+         InlineKeyboardButton("Settings", callback_data="menu_settings")]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+# Utility: keyboard from list
 def keyboard_from_list(items: List[str], row_size=2):
-    keys=[]
+    rows=[]
     for i in range(0,len(items),row_size):
-        row=[InlineKeyboardButton(text=str(x), callback_data=str(x)) for x in items[i:i+row_size]]
-        keys.append(row)
-    return InlineKeyboardMarkup(keys)
+        rows.append([InlineKeyboardButton(text=x, callback_data=f"pick|{x}") for x in items[i:i+row_size]])
+    return InlineKeyboardMarkup(rows)
 
-def split_into_scenes(desc: str, n_scenes: int) -> List[str]:
-    # Improved splitting: try sentences, fallback to clauses and balanced chunks
+# --- Mini-AI enhancer (local heuristics) ---
+def mini_ai_enhance(scene_short: str) -> Dict[str,str]:
+    title = scene_short.strip()[:48].rstrip(" .,!?:;") + ("..." if len(scene_short.strip())>48 else "")
+    style = random.choice(STYLE_POOL)
+    mood = random.choice(MOOD_POOL)
+    camera = random.choice(["close-up","wide shot","tracking shot","slow zoom","overhead","dolly in"])
+    color = random.choice(["neon blues and magentas","warm golden hour tones","muted earth tones","high-contrast monochrome","pastel palette"])
+    adjective = random.choice(["soft","harsh","glowing","muted","vibrant","textured","grainy","pristine"])
+    expanded = (
+        f"{scene_short}. Details: {adjective} surfaces, {color}. "
+        f"Ambience cues: distant hum, soft wind. Lighting: {style} with a {mood} tone. "
+        f"Suggested shot: {camera}. Add subtle particle effects and depth-of-field."
+    )
+    # basic sanitization: remove very explicit violent verbs
+    for bad in ["разстрелять","убить","убивают","shoot","kill"]:
+        expanded = expanded.replace(bad, "[removed]")
+    return {"title": title, "brief": expanded, "style": style, "mood": mood, "camera": camera, "color": color}
+
+# --- Deepseek integration helper (optional) ---
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")  # set this in env if you want remote polishing
+DEEPSEEK_API_URL = os.getenv("DEEPSEEK_API_URL", "https://aimlapi.com/app/api")  # user can override if needed
+
+def call_deepseek_polish(prompt_text: str) -> str:
+    """
+    Polishes the prompt_text via Deepseek (if API key provided).
+    This is a best-effort wrapper. The exact endpoint/path may differ depending on provider.
+    We send a JSON POST with {"prompt": "..."} and Authorization header.
+    If the API call fails, we return the original prompt_text.
+    """
+    if not DEEPSEEK_API_KEY:
+        return prompt_text
+    try:
+        headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+        payload = {"prompt": prompt_text}
+        resp = requests.post(DEEPSEEK_API_URL, json=payload, headers=headers, timeout=12)
+        if resp.status_code == 200:
+            data = resp.json()
+            # try common keys
+            if isinstance(data, dict):
+                for key in ("result","output","polished","text"):
+                    if key in data and isinstance(data[key], str) and data[key].strip():
+                        return data[key].strip()
+            # fallback: if response is text
+            if isinstance(data, str):
+                return data
+        else:
+            logger.warning("Deepseek API returned status %s: %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.exception("Deepseek call failed: %s", e)
+    return prompt_text
+
+# --- Flow handlers ---
+async def ensure_session(user_id:int):
+    if user_id not in SESSIONS:
+        SESSIONS[user_id] = {"state":"idle","last_prompts":[]}
+
+async def any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Reply to any non-command message with a friendly menu (so user doesn't have to type /start).
+    """
+    user_id = update.effective_user.id
+    await ensure_session(user_id)
+    await update.message.reply_text("Main Menu — выбери действие / choose action:", reply_markup=main_menu_kb())
+
+# Menu callback handler
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    await ensure_session(user_id)
+    data = query.data
+
+    if data == "menu_create":
+        # start create flow: choose language
+        await query.edit_message_text("Choose language / Выберите язык:", reply_markup=keyboard_from_list([f\"{k} — {v}\" for k,v in LANGUAGES.items()], row_size=2))
+        SESSIONS[user_id]["state"] = "choosing_language"
+        return
+    if data == "menu_improve":
+        # run improve on last prompts
+        session = SESSIONS[user_id]
+        if not session.get("last_prompts"):
+            await query.edit_message_text("No prompts generated yet. Create first.")
+            return
+        # apply local improvements
+        for p in session["last_prompts"]:
+            p["prompt"] += "\\n--IMPROVED: add cinematic grain; try 24fps; experimental color swap"
+            p["meta"]["improved"] = True
+        await query.edit_message_text("Prompts improved locally. Use Export to download or /improve for remote polish.")
+        return
+    if data == "menu_export":
+        session = SESSIONS[user_id]
+        if not session.get("last_prompts"):
+            await query.edit_message_text("No prompts to export. Create first.")
+            return
+        # create zip in-memory and send
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("prompts.json", json.dumps(session, ensure_ascii=False, indent=2))
+        buf.seek(0)
+        await query.edit_message_text("Exporting prompts.zip...")
+        await context.bot.send_document(chat_id=user_id, document=InputFile(buf, filename="prompts.zip"))
+        return
+    if data == "menu_settings":
+        keys = []
+        keys.append([InlineKeyboardButton("Toggle Deepseek (env)", callback_data="setting|deepseek")])
+        keys.append([InlineKeyboardButton("Back to Menu", callback_data="menu_back")])
+        await query.edit_message_text("Settings:", reply_markup=InlineKeyboardMarkup(keys))
+        return
+    if data == "menu_back":
+        await query.edit_message_text("Main Menu:", reply_markup=main_menu_kb())
+        return
+
+    # Picking language / platform flow
+    if data.startswith("pick|"):
+        pick = data.split("|",1)[1]
+        user_session = SESSIONS[user_id]
+        state = user_session.get("state")
+        if state == "choosing_language":
+            # store language code (format "ru — Русский")
+            lang_code = pick.split(" — ")[0]
+            user_session["language"] = lang_code
+            user_session["state"] = "choosing_platform"
+            await query.edit_message_text("Language set to %s. Now choose platform:" % pick, reply_markup=keyboard_from_list(PLATFORMS, row_size=2))
+            return
+        if state == "choosing_platform":
+            user_session["platform"] = pick
+            user_session["state"] = "awaiting_description"
+            await query.edit_message_text("Platform set to %s. Send a short description of your idea (one sentence):" % pick)
+            return
+
+    # fallback
+    await query.edit_message_text("Unhandled menu action. Back to main menu.", reply_markup=main_menu_kb())
+
+# Message handler for collecting description, scenes, duration
+async def message_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await ensure_session(user_id)
+    user_session = SESSIONS[user_id]
+    state = user_session.get("state","idle")
+    text = update.message.text.strip()
+    if state == "awaiting_description":
+        user_session["description"] = text
+        user_session["state"] = "awaiting_scenes"
+        await update.message.reply_text("Got it. How many scenes? (e.g. 6)")
+        return
+    if state == "awaiting_scenes":
+        try:
+            n = int(text)
+            if n < 1 or n > 200:
+                raise ValueError()
+        except:
+            await update.message.reply_text("Please send a valid number between 1 and 200.")
+            return
+        user_session["n_scenes"] = n
+        user_session["state"] = "awaiting_duration"
+        await update.message.reply_text("Duration per scene in seconds (number) or 'var' for variable durations:")
+        return
+    if state == "awaiting_duration":
+        if text.lower() == "var":
+            user_session["duration_mode"] = "var"
+            user_session["duration_value"] = None
+        else:
+            try:
+                d = int(text)
+                if d < 1 or d > 3600: raise ValueError()
+                user_session["duration_mode"] = "fixed"
+                user_session["duration_value"] = d
+            except:
+                await update.message.reply_text("Send integer seconds (1-3600) or 'var'.")
+                return
+        # ready to generate
+        await update.message.reply_text("Generating prompts... (this may take a couple seconds)")
+        prompts = generate_prompts_for_session(user_id)
+        user_session["last_prompts"] = prompts
+        user_session["state"] = "idle"
+        # send short list summary
+        lines = [f"Generated {len(prompts)} prompts for {user_session.get('platform')}:"]
+        for p in prompts:
+            lines.append(f"- Scene {p['index']}: {p['meta']['title']} ({p['duration']}s)")
+        await update.message.reply_text("\\n".join(lines))
+        await update.message.reply_text("Use the menu to Improve or Export. Or click /improve for remote polish.")
+        return
+    # default: show menu
+    await update.message.reply_text("Main Menu:", reply_markup=main_menu_kb())
+
+# Prompt generation logic
+def split_into_scenes(desc: str, n_scenes:int) -> List[str]:
     import re
     desc = desc.strip()
     if not desc:
-        return [f"Scene placeholder {i+1}" for i in range(n_scenes)]
-    sentences = re.split(r'(?<=[.!?])\s+', desc)
-    # If too many sentences, group them
-    if len(sentences) >= n_scenes:
-        per = max(1, len(sentences)//n_scenes)
+        return [f"Scene {i+1}" for i in range(n_scenes)]
+    sents = re.split(r'(?<=[.!?])\\s+', desc)
+    if len(sents) >= n_scenes:
+        per = max(1, len(sents)//n_scenes)
         scenes=[]
         i=0
-        while len(scenes)<n_scenes and i<len(sentences):
-            scenes.append(" ".join(sentences[i:i+per]).strip())
-            i+=per
-        while len(scenes)<n_scenes:
+        while len(scenes) < n_scenes and i < len(sents):
+            scenes.append(" ".join(sents[i:i+per]).strip())
+            i += per
+        while len(scenes) < n_scenes:
             scenes.append("A continuing visual scene.")
         return scenes[:n_scenes]
-    # If fewer sentences, split by commas/clauses
-    clauses = re.split(r',\s*', desc)
+    clauses = re.split(r',\\s*', desc)
     if len(clauses) >= n_scenes:
         per = max(1, len(clauses)//n_scenes)
         scenes=[]
         i=0
-        while len(scenes)<n_scenes and i<len(clauses):
+        while len(scenes) < n_scenes and i < len(clauses):
             scenes.append(", ".join(clauses[i:i+per]).strip())
-            i+=per
-        while len(scenes)<n_scenes:
+            i += per
+        while len(scenes) < n_scenes:
             scenes.append("A bridging visual scene.")
         return scenes[:n_scenes]
-    # fallback: equal-length chunks
-    chunk_len = max(30, len(desc)//n_scenes)
-    scenes = [desc[i:i+chunk_len].strip() for i in range(0, len(desc), chunk_len)]
-    if len(scenes) >= n_scenes:
-        return scenes[:n_scenes]
-    while len(scenes)<n_scenes:
-        scenes.append("A bridging visual scene.")
-    return scenes
+    # fallback
+    chunk = max(30, len(desc)//n_scenes)
+    parts = [desc[i:i+chunk].strip() for i in range(0,len(desc),chunk)]
+    if len(parts) >= n_scenes:
+        return parts[:n_scenes]
+    while len(parts) < n_scenes:
+        parts.append("A bridging visual scene.")
+    return parts
 
-def mini_ai_enhance(scene_short: str) -> Dict[str,str]:
-    # Produce structured enhanced scene metadata
-    title = scene_short[:40].rstrip(" .,!?:;") + ("..." if len(scene_short)>40 else "")
-    style = random.choice(STYLE_POOL)
-    mood = random.choice(MOOD_POOL)
-    camera = random.choice(CAMERA_MOVES)
-    color = random.choice(COLOR_PALETTES)
-    adjective = random.choice(ADJECTIVES)
-    # Expand description with sensory detail heuristics
-    expanded = (
-        f"{scene_short}. Visual details: {adjective} textures, {color}. "
-        f"Focus on movement and emotion; include sound cues: subtle ambience and distant echoes. "
-        f"Lighting: {style} with {mood} undertone. "
-        f"Shot suggestions: {camera}, include a brief close-up to capture expression."
-    )
-    # safety: simple cleanup of explicit violent words
-    expanded = expanded.replace("разстрелять","[violence removed]")
-    return {
-        "scene_title": title,
-        "scene_brief": expanded,
-        "style": style,
-        "mood": mood,
-        "camera": camera,
-        "color": color
-    }
-
-# Session storage (per-user last generation)
-USER_SESSIONS = {}
-
-# Bot handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = keyboard_from_list([f"{code} — {name}" for code,name in LANGUAGES.items()], row_size=2)
-    await update.message.reply_text("Привет! Выбери язык / Choose language:", reply_markup=kb)
-    return CHOOSING_LANG
-
-async def lang_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    # data format "ru — Русский"
-    code = data.split(" — ")[0]
-    context.user_data["lang"] = code
-    # ask platform
-    await q.edit_message_text(text=("Язык выбран. Теперь выбери платформу:" if code=='ru' else "Language set. Choose a platform:"),
-                              reply_markup=keyboard_from_list(PLATFORMS, row_size=2))
-    return CHOOSING_PLATFORM
-
-async def platform_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    platform = q.data
-    context.user_data["platform"] = platform
-    lang = context.user_data.get("lang","ru")
-    await q.edit_message_text(("Напиши краткое описание идеи (коротко):" if lang=='ru' else "Send a short description of the idea:"))
-    return INPUT_DESC
-
-async def receive_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    desc = update.message.text.strip()
-    context.user_data["description"] = desc
-    lang = context.user_data.get("lang","ru")
-    await update.message.reply_text(("Сколько сцен нужно? Введи число, например 6" if lang=='ru' else "How many scenes? Send a number, e.g. 6"))
-    return INPUT_SCENES
-
-async def receive_scenes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    lang = context.user_data.get("lang","ru")
-    try:
-        n = int(text)
-        if n<=0 or n>200:
-            raise ValueError
-    except Exception:
-        await update.message.reply_text(("Введите корректное число сцен (1-200)." if lang=='ru' else "Please send a valid number of scenes (1-200)."))
-        return INPUT_SCENES
-    context.user_data["n_scenes"] = n
-    await update.message.reply_text(("Длительность каждой сцены в секундах (число) или 'var' для вариативной длительности:" if lang=='ru' else "Duration per scene in seconds (number) or 'var' for variable durations:"))
-    return INPUT_DURATION
-
-async def receive_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().lower()
-    lang = context.user_data.get("lang","ru")
-    if text == 'var':
-        context.user_data["duration_mode"] = "var"
-        context.user_data["duration_value"] = None
-    else:
-        try:
-            d = int(text)
-            if d<=0 or d>3600:
-                raise ValueError
-            context.user_data["duration_mode"] = "fixed"
-            context.user_data["duration_value"] = d
-        except Exception:
-            await update.message.reply_text(("Введите корректное время (1-3600) или 'var'." if lang=='ru' else "Please send a valid duration (1-3600) or 'var'."))
-            return INPUT_DURATION
-
-    platform = context.user_data.get("platform")
-    n = context.user_data.get("n_scenes")
-    desc = context.user_data.get("description")
-    confirm = (f"Готово: {n} сцен для {platform}. Описание: {desc}. Длительность: {'вариативная' if context.user_data['duration_mode']=='var' else str(context.user_data['duration_value'])+'s'}\nОтправь /generate"
-               if context.user_data.get("lang","ru")=='ru'
-               else f"Ready: {n} scenes for {platform}. Description: {desc}. Duration: {'variable' if context.user_data['duration_mode']=='var' else str(context.user_data['duration_value'])+'s'}\nSend /generate")
-    await update.message.reply_text(confirm)
-    return CONFIRM
-
-async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = context.user_data
-    platform = user.get("platform","CustomModel")
-    n = user.get("n_scenes",5)
-    desc = user.get("description","An idea")
-    dur_mode = user.get("duration_mode","fixed")
-    dur_val = user.get("duration_value",5)
-    lang = user.get("lang","ru")
-
+def generate_prompts_for_session(user_id:int) -> List[Dict[str,Any]]:
+    session = SESSIONS[user_id]
+    desc = session.get("description","An idea")
+    n = session.get("n_scenes",4)
+    dur_mode = session.get("duration_mode","fixed")
+    dur_val = session.get("duration_value",6)
+    platform = session.get("platform","CustomModel")
     scenes_short = split_into_scenes(desc, n)
-    # generate structured scenes using mini_ai_enhance
-    scenes=[]
-    for s in scenes_short:
-        meta = mini_ai_enhance(s)
-        scenes.append(meta)
-    # durations
-    if dur_mode=="fixed":
-        durations=[dur_val]*n
-    else:
-        durations=[random.randint(max(1, int(0.5*dur_val or 4)), max(4, int(2* (dur_val or 10)))) if dur_val else random.randint(4,15) for _ in range(n)]
-    # build prompts
-    template = PLATFORM_TEMPLATES.get(platform, PLATFORM_TEMPLATES["default"])
     prompts=[]
-    for i,meta in enumerate(scenes):
-        duration = durations[i]
-        aspect="16:9"
-        negative = "avoid text overlays; avoid logos; avoid watermarks"
-        details = f"Scene {i+1}/{n}. Auto-generated enhancements applied."
-        prompt = template.format(
-            scene_title=meta["scene_title"],
-            scene_brief=meta["scene_brief"],
+    for i,s in enumerate(scenes_short):
+        meta = mini_ai_enhance(s)
+        duration = dur_val if dur_mode=="fixed" else random.randint(3,15)
+        template = (
+            "{title}\\n{brief}\\nStyle: {style}\\nMood: {mood}\\nCamera: {camera}\\nDuration: {duration}s\\nNegative: {negative}\\nNotes: auto-generated"
+        )
+        prompt_text = template.format(
+            title=meta["title"],
+            brief=meta["brief"],
             style=meta["style"],
             mood=meta["mood"],
             camera=meta["camera"],
             duration=duration,
-            aspect=aspect,
-            negative=negative,
-            details=details
+            negative="avoid text, logos, watermarks"
         )
+        # if remote Deepseek available, attempt polishing (best-effort, non-blocking)
+        polished = call_deepseek_polish(prompt_text) if DEEPSEEK_API_KEY else prompt_text
         prompts.append({
             "index": i+1,
             "duration": duration,
-            "aspect": aspect,
             "platform": platform,
-            "prompt": prompt,
+            "prompt": polished,
             "meta": meta
         })
-    # store in session
-    USER_SESSIONS[user_id] = {
-        "generated_at": datetime.utcnow().isoformat()+"Z",
-        "platform": platform,
-        "language": lang,
-        "description": desc,
-        "prompts": prompts
-    }
-    # send summaries (short)
-    out_lines=[f"=== Generated {len(prompts)} prompts for {platform} ==="]
-    for p in prompts:
-        out_lines.append(f"Scene {p['index']}/{len(prompts)} — {p['duration']}s — {p['meta']['scene_title']}")
-    # send as messages (chunk safe)
-    full = "\\n".join(out_lines)
-    CHUNK=3800
-    for i in range(0,len(full),CHUNK):
-        await update.message.reply_text(full[i:i+CHUNK])
-    await update.message.reply_text(("/improve — улучшить промпты\\n/export — получить ZIP с prompts.json"
-                                    if lang=='ru' else "/improve — enhance prompts\\n/export — download ZIP with prompts.json"))
-    return ConversationHandler.END
+    return prompts
 
-async def improve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# /improve command -> try remote polish (Deepseek) if key present
+async def cmd_improve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    session = USER_SESSIONS.get(user_id)
-    if not session:
-        await update.message.reply_text("No generated prompts found. Generate first with /generate." if context.user_data.get("lang","ru")!="ru" else "Нет сгенерированных промптов. Сначала используй /generate.")
+    await ensure_session(user_id)
+    session = SESSIONS[user_id]
+    if not session.get("last_prompts"):
+        await update.message.reply_text("No prompts to improve. Create first.")
         return
-    # enhance each prompt further by adding camera cues, negative prompts, and variants
-    for p in session["prompts"]:
-        p["prompt"] += "\\n--VARIATION: swap color palette to " + random.choice(COLOR_PALETTES)
-        p["prompt"] += "\\n--HINT: try 24fps for cinematic feel; seed=random"
-        p["meta"]["enhanced"] = True
-    await update.message.reply_text(("Prompts improved and annotated. Use /export to download." if context.user_data.get("lang","ru")!="ru" else "Промпты улучшены и аннотированы. Используй /export для скачивания."))
-    return
+    if not DEEPSEEK_API_KEY:
+        await update.message.reply_text("No remote API key configured. Improved locally instead.")
+        # local improvement
+        for p in session["last_prompts"]:
+            p["prompt"] += "\\n--LOCAL_IMPROVE: add cinematic color grade and subtle film grain."
+        await update.message.reply_text("Local improvements applied. Use Export to download.")
+        return
+    # Remote polishing loop
+    await update.message.reply_text("Polishing prompts with Deepseek...")
+    for p in session["last_prompts"]:
+        try:
+            polished = call_deepseek_polish(p["prompt"])
+            p["prompt_remote"] = polished
+        except Exception as e:
+            logger.exception("Polish failed: %s", e)
+    await update.message.reply_text("Remote polishing finished. Use /export to download JSON/ZIP.")
 
-async def export_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# /export command
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    session = USER_SESSIONS.get(user_id)
-    if not session:
-        await update.message.reply_text("No prompts to export. Run /generate first." if context.user_data.get("lang","ru")!="ru" else "Нет промптов для экспорта. Сначала /generate.")
+    await ensure_session(user_id)
+    session = SESSIONS[user_id]
+    if not session.get("last_prompts"):
+        await update.message.reply_text("No prompts to export.")
         return
-    # create JSON and ZIP
-    base_dir = Path("/tmp") / f"prompt_export_{user_id}"
-    base_dir.mkdir(parents=True, exist_ok=True)
-    json_path = base_dir / "prompts.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(session, f, ensure_ascii=False, indent=2)
-    zip_path = base_dir / "prompts_export.zip"
-    import zipfile
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(json_path, arcname="prompts.json")
-    # send zip
-    await update.message.reply_document(document=InputFile(str(zip_path)), filename="prompts_export.zip")
-    return
+    # create zip in-memory
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("prompts.json", json.dumps(session, ensure_ascii=False, indent=2))
+    buf.seek(0)
+    await update.message.reply_document(document=InputFile(buf, filename="prompts_export.zip"))
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Cancelled. /start to begin again." if context.user_data.get("lang","ru")!="ru" else "Отменено. /start чтобы начать заново.")
-    return ConversationHandler.END
+# /settings command shows info and instructions to set DEEPSEEK_API_KEY
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = [
+        "Settings & Tips:",
+        "• To enable remote polishing (Deepseek), set environment variable DEEPSEEK_API_KEY with your token.",
+        "• Example (Linux): export DEEPSEEK_API_KEY=\"your_token_here\"",
+        "• The bot will never store your token in the exported prompts.json.",
+        "• To change Telegram token, update TG_TOKEN in your host."
+    ]
+    await update.message.reply_text("\\n".join(lines))
 
-# Main
-from pathlib import Path
+# Start the bot and handlers
 def main():
     token = os.getenv("TG_TOKEN", "PASTE_YOUR_TOKEN_HERE")
     if token == "PASTE_YOUR_TOKEN_HERE":
-        logger.warning("TG_TOKEN not set. Set it in environment for the bot to work.")
+        logger.warning("TG_TOKEN not set. Set it in the environment before running.")
     app = ApplicationBuilder().token(token).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            CHOOSING_LANG: [CallbackQueryHandler(lang_choice)],
-            CHOOSING_PLATFORM: [CallbackQueryHandler(platform_choice)],
-            INPUT_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_description)],
-            INPUT_SCENES: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_scenes)],
-            INPUT_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_duration)],
-            CONFIRM: []
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True
-    )
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("generate", generate))
-    app.add_handler(CommandHandler("improve", improve))
-    app.add_handler(CommandHandler("export", export_prompts))
-    app.add_handler(CommandHandler("cancel", cancel))
+    # Handlers
+    app.add_handler(CallbackQueryHandler(menu_router))
+    app.add_handler(CommandHandler("menu", lambda u,c: c.bot.send_message(chat_id=u.effective_chat.id, text="Main Menu:", reply_markup=main_menu_kb())))
+    app.add_handler(CommandHandler("improve", cmd_improve))
+    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    # Any normal message triggers the menu (so user doesn't have to type /start)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, any_message))
+    # Message collector for the interactive flow (description/scenes/duration)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_collector))
     app.run_polling()
 
 if __name__ == "__main__":
