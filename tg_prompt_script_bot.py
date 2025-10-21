@@ -162,11 +162,28 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_create":
         # start create flow: choose language
-        await query.edit_message_text("Choose language / Выберите язык:", reply_markup=keyboard_from_list([f\"{k} — {v}\" for k,v in LANGUAGES.items()], row_size=2))
+        await query.edit_message_text(
+            "Choose language / Выберите язык:",
+            reply_markup=keyboard_from_list([f"{k} — {v}" for k, v in LANGUAGES.items()], row_size=2)
+        )
         SESSIONS[user_id]["state"] = "choosing_language"
         return
+
     if data == "menu_improve":
         # run improve on last prompts
+        session = SESSIONS[user_id]
+        if not session.get("last_prompts"):
+            await query.edit_message_text("No prompts generated yet. Create first.")
+            return
+        # apply local improvements
+        improved_prompts = []
+        for p in session["last_prompts"]:
+            enhanced = mini_ai_enhance(p["brief"])
+            improved_prompts.append(enhanced)
+        session["last_prompts"] = improved_prompts
+        await query.edit_message_text("Prompts improved ✨", reply_markup=main_menu_kb())
+        return
+
         session = SESSIONS[user_id]
         if not session.get("last_prompts"):
             await query.edit_message_text("No prompts generated yet. Create first.")
